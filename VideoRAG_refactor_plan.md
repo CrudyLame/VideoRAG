@@ -144,8 +144,3 @@ Enforce via system prompt or JSON schema validation:
 3. Validate retrieval quality and response schema with integration tests.
 4. Iterate on prompt templates and tuning for structured outputs.
 
-## Implementation Status
-- `videorag/_op.py` contains the decomposed `CloudVideoRAGService` built from dedicated helpers for segmentation, captioning, summarisation, embeddings, and Supabase storage.
-- `videorag/_videoutil` hosts the OpenAI-powered segmenters, captioners, and summariser modules backing ingestion.
-- `videorag/videorag.py` exposes a lightweight synchronous/asynchronous wrapper around the service for backwards compatibility with existing imports.
-
