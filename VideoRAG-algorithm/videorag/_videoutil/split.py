@@ -1,80 +1,96 @@
-import os
-import time
-import shutil
+"""Video segmentation helpers for the cloud-native pipeline."""
+
+from __future__ import annotations
+
+import base64
+import math
+import tempfile
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import List, Optional, Tuple
+
 import numpy as np
-from tqdm import tqdm
-from moviepy.video import fx as vfx
 from moviepy.video.io.VideoFileClip import VideoFileClip
-from .._utils import logger
+from PIL import Image
 
-def split_video(
-    video_path,
-    working_dir,
-    segment_length,
-    num_frames_per_segment,
-    audio_output_format='mp3',
-):  
-    unique_timestamp = str(int(time.time() * 1000))
-    video_name = os.path.basename(video_path).split('.')[0]
-    video_segment_cache_path = os.path.join(working_dir, '_cache', video_name)
-    if os.path.exists(video_segment_cache_path):
-        shutil.rmtree(video_segment_cache_path)
-    os.makedirs(video_segment_cache_path, exist_ok=False)
-    
-    segment_index = 0
-    segment_index2name, segment_times_info = {}, {}
-    with VideoFileClip(video_path) as video:
-    
-        total_video_length = int(video.duration)
-        start_times = list(range(0, total_video_length, segment_length))
-        # if the last segment is shorter than 5 seconds, we merged it to the last segment
-        if len(start_times) > 1 and (total_video_length - start_times[-1]) < 5:
-            start_times = start_times[:-1]
-        
-        for start in tqdm(start_times, desc=f"Spliting Video {video_name}"):
-            if start != start_times[-1]:
-                end = min(start + segment_length, total_video_length)
-            else:
-                end = total_video_length
-            
-            subvideo = video.subclip(start, end)
-            subvideo_length = subvideo.duration
-            frame_times = np.linspace(0, subvideo_length, num_frames_per_segment, endpoint=False)
-            frame_times += start
-            
-            segment_index2name[f"{segment_index}"] = f"{unique_timestamp}-{segment_index}-{start}-{end}"
-            segment_times_info[f"{segment_index}"] = {"frame_times": frame_times, "timestamp": (start, end)}
-            
-            # save audio
-            audio_file_base_name = segment_index2name[f"{segment_index}"]
-            audio_file = f'{audio_file_base_name}.{audio_output_format}'
-            try:
-                subaudio = subvideo.audio
-                subaudio.write_audiofile(os.path.join(video_segment_cache_path, audio_file), codec='mp3', verbose=False, logger=None)
-            except Exception as e:
-                logger.warning(f"Warning: Failed to extract audio for video {video_name} ({start}-{end}). Probably due to lack of audio track.")
 
-            segment_index += 1
+@dataclass(slots=True)
+class VideoSegment:
+    """Metadata for a single video segment."""
 
-    return segment_index2name, segment_times_info
+    id: str
+    start: float
+    end: float
+    frames_base64: List[str]
+    audio_path: Optional[Path]
 
-def saving_video_segments(
-    video_name,
-    video_path,
-    working_dir,
-    segment_index2name,
-    segment_times_info,
-    error_queue,
-    video_output_format='mp4',
-):
-    try:
-        with VideoFileClip(video_path) as video:
-            video_segment_cache_path = os.path.join(working_dir, '_cache', video_name)
-            for index in tqdm(segment_index2name, desc=f"Saving Video Segments {video_name}"):
-                start, end = segment_times_info[index]["timestamp"][0], segment_times_info[index]["timestamp"][1]
-                video_file = f'{segment_index2name[index]}.{video_output_format}'
-                subvideo = video.subclip(start, end)
-                subvideo.write_videofile(os.path.join(video_segment_cache_path, video_file), codec='libx264', verbose=False, logger=None)
-    except Exception as e:
-        error_queue.put(f"Error in saving_video_segments:\n {str(e)}")
-        raise RuntimeError
+
+class VideoSegmenter:
+    """Split videos into temporal chunks and export keyframes/audio."""
+
+    def __init__(
+        self,
+        segment_duration: int = 30,
+        frames_per_segment: int = 6,
+    ) -> None:
+        self.segment_duration = max(1, segment_duration)
+        self.frames_per_segment = max(0, frames_per_segment)
+
+    def segment(self, video_path: str) -> Tuple[list[VideoSegment], Path]:
+        """Return ``VideoSegment`` objects and a temp directory for artifacts."""
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="videorag_segments_"))
+        segments: list[VideoSegment] = []
+
+        with VideoFileClip(video_path) as clip:
+            duration = clip.duration or 0.0
+            total_segments = int(math.ceil(duration / self.segment_duration))
+
+            for index in range(total_segments):
+                start = index * self.segment_duration
+                end = min((index + 1) * self.segment_duration, duration)
+                segment_id = f"seg-{index:04d}-{int(start * 1000)}-{int(end * 1000)}"
+
+                subclip = clip.subclip(start, end)
+
+                frame_offsets = self._frame_offsets(subclip.duration)
+                frames_base64 = [
+                    self._frame_to_base64(subclip.get_frame(offset))
+                    for offset in frame_offsets
+                ]
+
+                audio_path: Optional[Path] = None
+                if subclip.audio is not None:
+                    audio_path = temp_dir / f"{segment_id}.mp3"
+                    subclip.audio.write_audiofile(
+                        audio_path.as_posix(),
+                        codec="mp3",
+                        verbose=False,
+                        logger=None,
+                    )
+
+                segments.append(
+                    VideoSegment(
+                        id=segment_id,
+                        start=float(start),
+                        end=float(end),
+                        frames_base64=frames_base64,
+                        audio_path=audio_path,
+                    )
+                )
+
+        return segments, temp_dir
+
+    def _frame_offsets(self, duration: float) -> np.ndarray:
+        if self.frames_per_segment <= 0 or duration <= 0:
+            return np.array([], dtype=np.float32)
+        return np.linspace(0, max(duration - 0.001, 0.0), self.frames_per_segment, endpoint=False)
+
+    @staticmethod
+    def _frame_to_base64(frame: np.ndarray) -> str:
+        image = Image.fromarray(frame.astype("uint8"))
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=90)
+        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return f"data:image/jpeg;base64,{encoded}"
